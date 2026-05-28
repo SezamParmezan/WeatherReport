@@ -48,7 +48,7 @@ def load_month(nc_path: Path) -> pd.DataFrame:
     Index = DatetimeIndex (hourly), columns = renamed variables.
     ERA5 bbox may contain several lat/lon grid points — averaged spatially.
     """
-    ds = xr.open_dataset(nc_path)
+    ds = xr.open_dataset(nc_path, engine="scipy")
     frames = {}
 
     for nc_var, col_name in VARIABLES.items():
@@ -76,7 +76,7 @@ def load_year(year: int) -> pd.DataFrame | None:
     """
     dfs = []
     for month in range(1, 13):
-        nc_path = RAW_DATA_DIR / f"rome_{year}_{month:02d}.nc"
+        nc_path = RAW_DATA_DIR / str(year) / f"rome_{year}_{month:02d}.nc"
         if not nc_path.exists():
             logger.warning("File %s does not exist, skipping", nc_path)
             continue
