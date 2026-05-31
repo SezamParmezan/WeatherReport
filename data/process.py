@@ -2,6 +2,8 @@ import os
 import argparse
 import logging
 import json
+import zipfile
+import tempfile
 
 import xarray as xr
 import numpy as np
@@ -12,8 +14,8 @@ from tqdm import tqdm
 
 
 # CONFIG
-RAW_DATA_DIR = Path("data/raw/era5")
-PROCESSED_DATA_DIR = Path("data/processed")
+RAW_DATA_DIR = Path(__file__).parent.parent / "data/raw/era5"
+PROCESSED_DATA_DIR = Path(__file__).parent.parent / "data/processed"
 PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATS_FILE = PROCESSED_DATA_DIR / "stats.json"
 
@@ -24,14 +26,16 @@ TRAIN_END = 2020
 VAL_END = 2022
 
 VARIABLES = {
+    #instant variables
     "u10": "wind_u",
     "v10": "wind_v",
     "d2m": "dewpoint_temp",
     "t2m": "temperature",
     "msl": "pressure_msl",
-    "sp": "pressure_surf",
-    "tp": "precipitation",
+    "sp":  "pressure_surf",
     "tcc": "cloud_cover",
+    #accum variable
+    "tp": "precipitation",
 }
 
 logging.basicConfig(
@@ -47,27 +51,83 @@ def load_month(nc_path: Path) -> pd.DataFrame:
     Open one monthly .nc file and return a tidy DataFrame.
     Index = DatetimeIndex (hourly), columns = renamed variables.
     ERA5 bbox may contain several lat/lon grid points — averaged spatially.
+    Handles both raw NetCDF and ZIP-compressed NetCDF files.
     """
-    ds = xr.open_dataset(nc_path, engine="scipy")
-    frames = {}
+    # If the file is a ZIP archive, extract and read inside temp directory context
+    if zipfile.is_zipfile(nc_path):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with zipfile.ZipFile(nc_path, 'r') as zip_ref:
+                zip_ref.extractall(tmpdir)
 
-    for nc_var, col_name in VARIABLES.items():
-        if nc_var not in ds:
-            logger.warning("Variable '%s' not found in %s — filling with NaN", nc_var, nc_path.name)
-            frames[col_name] = None
-            continue
+            instant_path = Path(tmpdir) / "data_stream-oper_stepType-instant.nc"
+            accum_path = Path(tmpdir) / "data_stream-oper_stepType-accum.nc"
 
-        da = ds[nc_var]
-        spatial_dims = [d for d in da.dims if d in ("latitude", "longitude", "lat", "lon")]
-        if spatial_dims:
-            da = da.mean(dim=spatial_dims)
+            ds_instant = xr.open_dataset(instant_path, engine="netcdf4")
+            ds_accum = xr.open_dataset(accum_path,   engine="netcdf4")
+            ds = xr.merge([ds_instant, ds_accum], compat="override")
 
-        frames[col_name] = da.to_series()
+            ds.load()
+            ds_instant.close()
+            ds_accum.close()
 
-    ds.close()
-    df = pd.DataFrame(frames)
-    df.index.name = "time"
-    return df
+            frames = {}
+            time_index = None
+
+            for nc_var, col_name in VARIABLES.items():
+                if nc_var not in ds:
+                    logger.warning("Variable '%s' not found in %s, filling with NaN", nc_var, nc_path.name)
+                    frames[col_name] = None
+                    continue
+
+                da = ds[nc_var].squeeze()
+                series = da.to_series()
+                if time_index is None:
+                    time_index = series.index
+                frames[col_name] = series
+
+            if time_index is not None:
+                for col_name, value in frames.items():
+                    if value is None:
+                        frames[col_name] = pd.Series(np.nan, index=time_index, dtype='float64')
+
+            ds_instant.close()
+            ds_accum.close()
+
+            df = pd.DataFrame(frames)
+            df.index.name = "time"
+            return df
+    else:
+        # Handle non-zipped files normally
+        ds = xr.open_dataset(nc_path, engine="netcdf4")
+        frames = {}
+        time_index = None
+
+        for nc_var, col_name in VARIABLES.items():
+            if nc_var not in ds:
+                logger.warning("Variable '%s' not found in %s, filling with NaN", nc_var, nc_path.name)
+                frames[col_name] = None
+                continue
+
+            da = ds[nc_var]
+            spatial_dims = [d for d in da.dims if d in ("latitude", "longitude", "lat", "lon")]
+            if spatial_dims:
+                da = da.mean(dim=spatial_dims)
+
+            series = da.to_series()
+            if time_index is None:
+                time_index = series.index
+            frames[col_name] = series
+
+        # Fill missing variables with NaN series
+        if time_index is not None:
+            for col_name, value in frames.items():
+                if value is None:
+                    frames[col_name] = pd.Series(np.nan, index=time_index, dtype='float64')
+
+        ds.close()
+        df = pd.DataFrame(frames)
+        df.index.name = "time"
+        return df
 
 
 def load_year(year: int) -> pd.DataFrame | None:
@@ -150,13 +210,13 @@ def run_pipeline(years: list[int], normalize: bool = True) -> None:
     PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     train_years = [y for y in years if y <= TRAIN_END]
-    val_years   = [y for y in years if TRAIN_END < y <= VAL_END]
-    test_years  = [y for y in years if y > VAL_END]
+    val_years = [y for y in years if TRAIN_END < y <= VAL_END]
+    test_years = [y for y in years if y > VAL_END]
 
     logger.info("Split — train: %s, val: %s, test: %s",
-                f"{min(train_years)}–{max(train_years)}" if train_years else "—",
-                f"{min(val_years)}–{max(val_years)}"     if val_years   else "—",
-                f"{min(test_years)}–{max(test_years)}"   if test_years  else "—")
+                f"{min(train_years)}–{max(train_years)}" if train_years else "-",
+                f"{min(val_years)}–{max(val_years)}" if val_years else "-",
+                f"{min(test_years)}–{max(test_years)}" if test_years else "-")
 
     train_stats = None
     if normalize:
