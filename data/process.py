@@ -55,50 +55,31 @@ def load_month(nc_path: Path) -> pd.DataFrame:
     """
     # If the file is a ZIP archive, extract and read inside temp directory context
     if zipfile.is_zipfile(nc_path):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with zipfile.ZipFile(nc_path, 'r') as zip_ref:
-                zip_ref.extractall(tmpdir)
+        extract_dir = nc_path.parent / f"_tmp_{nc_path.stem}"
+        extract_dir.mkdir(exist_ok=True)
 
-            instant_path = Path(tmpdir) / "data_stream-oper_stepType-instant.nc"
-            accum_path = Path(tmpdir) / "data_stream-oper_stepType-accum.nc"
+        try:
+            with zipfile.ZipFile(nc_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+
+            instant_path = extract_dir / "data_stream-oper_stepType-instant.nc"
+            accum_path   = extract_dir / "data_stream-oper_stepType-accum.nc"
 
             ds_instant = xr.open_dataset(instant_path, engine="netcdf4")
-            ds_accum = xr.open_dataset(accum_path,   engine="netcdf4")
+            ds_accum   = xr.open_dataset(accum_path,   engine="netcdf4")
             ds = xr.merge([ds_instant, ds_accum], compat="override")
-
             ds.load()
             ds_instant.close()
             ds_accum.close()
+            ds.close()
 
-            frames = {}
-            time_index = None
+        finally:
+            import gc
+            import shutil
 
-            for nc_var, col_name in VARIABLES.items():
-                if nc_var not in ds:
-                    logger.warning("Variable '%s' not found in %s, filling with NaN", nc_var, nc_path.name)
-                    frames[col_name] = None
-                    continue
+            gc.collect()
+            shutil.rmtree(extract_dir, ignore_errors=True)
 
-                da = ds[nc_var].squeeze()
-                series = da.to_series()
-                if time_index is None:
-                    time_index = series.index
-                frames[col_name] = series
-
-            if time_index is not None:
-                for col_name, value in frames.items():
-                    if value is None:
-                        frames[col_name] = pd.Series(np.nan, index=time_index, dtype='float64')
-
-            ds_instant.close()
-            ds_accum.close()
-
-            df = pd.DataFrame(frames)
-            df.index.name = "time"
-            return df
-    else:
-        # Handle non-zipped files normally
-        ds = xr.open_dataset(nc_path, engine="netcdf4")
         frames = {}
         time_index = None
 
@@ -108,23 +89,17 @@ def load_month(nc_path: Path) -> pd.DataFrame:
                 frames[col_name] = None
                 continue
 
-            da = ds[nc_var]
-            spatial_dims = [d for d in da.dims if d in ("latitude", "longitude", "lat", "lon")]
-            if spatial_dims:
-                da = da.mean(dim=spatial_dims)
-
+            da = ds[nc_var].squeeze()
             series = da.to_series()
             if time_index is None:
                 time_index = series.index
             frames[col_name] = series
 
-        # Fill missing variables with NaN series
         if time_index is not None:
             for col_name, value in frames.items():
                 if value is None:
                     frames[col_name] = pd.Series(np.nan, index=time_index, dtype='float64')
 
-        ds.close()
         df = pd.DataFrame(frames)
         df.index.name = "time"
         return df
@@ -260,7 +235,7 @@ def run_pipeline(years: list[int], normalize: bool = True) -> None:
         logger.info("Saved → %s | shape: %s", out_path, df.shape)
         processed += 1
 
-    logger.info("Done. Processed %d year(s).", processed)
+    logger.info("Done. Processed %d year(s)", processed)
 
 
 def parse_args() -> argparse.Namespace:
